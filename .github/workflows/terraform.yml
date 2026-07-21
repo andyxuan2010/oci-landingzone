@@ -1,0 +1,386 @@
+name: Terraform OCI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - sbx
+  pull_request:
+    branches:
+      - main
+      - dev
+      - sbx
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Run terraform apply after plan
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  check-required-secrets-variables:
+    name: Check Required Secrets and Variables
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_oci_credentials: ${{ steps.preflight.outputs.has_oci_credentials }}
+      has_apply_inputs: ${{ steps.preflight.outputs.has_apply_inputs }}
+      has_backend_inputs: ${{ steps.preflight.outputs.has_backend_inputs }}
+      has_stage_publish_inputs: ${{ steps.preflight.outputs.has_stage_publish_inputs }}
+      is_stage_repository: ${{ steps.preflight.outputs.is_stage_repository }}
+    steps:
+      - name: Evaluate required secrets and variables
+        id: preflight
+        shell: bash
+        env:
+          OCI_REGION: ${{ vars.OCI_REGION }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          ENABLE_GITHUB_APPLY: ${{ vars.ENABLE_GITHUB_APPLY }}
+          ENABLE_GITHUB_APPLY_MANUAL: ${{ github.event_name == 'workflow_dispatch' && inputs.apply == true && 'true' || 'false' }}
+          TF_BACKEND_READY: ${{ vars.TF_BACKEND_READY }}
+          TF_BACKEND_BUCKET: ${{ vars.TF_BACKEND_BUCKET }}
+          TF_BACKEND_NAMESPACE: ${{ vars.TF_BACKEND_NAMESPACE }}
+          TF_BACKEND_REGION: ${{ vars.TF_BACKEND_REGION }}
+          TF_BACKEND_KEY: ${{ vars.TF_BACKEND_KEY }}
+          OCI_STATE_ACCESS_KEY_ID: ${{ secrets.OCI_STATE_ACCESS_KEY_ID }}
+          OCI_STATE_SECRET_ACCESS_KEY: ${{ secrets.OCI_STATE_SECRET_ACCESS_KEY }}
+          STAGE_REPOSITORY: ${{ vars.STAGE_REPOSITORY }}
+          STAGE_REPO_TOKEN: ${{ secrets.STAGE_REPO_TOKEN }}
+          CURRENT_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          write_check() {
+            local input_type="$1"
+            local input_name="$2"
+            local input_value="$3"
+            local blue="\033[34m"
+            local yellow="\033[33m"
+            local green="\033[32m"
+            local red="\033[31m"
+            local reset="\033[0m"
+
+            if [[ -n "${input_value}" ]]; then
+              printf -- "- %b%s%b %b%s%b: %bpresent%b\n" "${blue}" "${input_type}" "${reset}" "${yellow}" "${input_name}" "${reset}" "${green}" "${reset}"
+            else
+              printf -- "- %b%s%b %b%s%b: %bmissing%b\n" "${blue}" "${input_type}" "${reset}" "${yellow}" "${input_name}" "${reset}" "${red}" "${reset}"
+            fi
+          }
+
+          enable_github_apply=""
+          [[ "${ENABLE_GITHUB_APPLY,,}" == "true" || "${ENABLE_GITHUB_APPLY_MANUAL,,}" == "true" ]] && enable_github_apply="true"
+
+          echo "::group::Required secrets and variables"
+          echo "OCI plan/apply requires:"
+          write_check "variable" "OCI_REGION" "${OCI_REGION}"
+          write_check "secret" "OCI_TENANCY_OCID" "${OCI_TENANCY_OCID}"
+          write_check "secret" "OCI_USER_OCID" "${OCI_USER_OCID}"
+          write_check "secret" "OCI_FINGERPRINT" "${OCI_FINGERPRINT}"
+          write_check "secret" "OCI_PRIVATE_KEY" "${OCI_PRIVATE_KEY}"
+          echo ""
+          echo "OCI remote state requires:"
+          write_check "variable" "TF_BACKEND_READY" "${TF_BACKEND_READY}"
+          write_check "variable" "TF_BACKEND_BUCKET" "${TF_BACKEND_BUCKET}"
+          write_check "variable" "TF_BACKEND_NAMESPACE" "${TF_BACKEND_NAMESPACE}"
+          write_check "variable" "TF_BACKEND_REGION" "${TF_BACKEND_REGION}"
+          write_check "variable" "TF_BACKEND_KEY" "${TF_BACKEND_KEY}"
+          write_check "secret" "OCI_STATE_ACCESS_KEY_ID" "${OCI_STATE_ACCESS_KEY_ID}"
+          write_check "secret" "OCI_STATE_SECRET_ACCESS_KEY" "${OCI_STATE_SECRET_ACCESS_KEY}"
+          echo ""
+          echo "Apply requires:"
+          write_check "variable/input" "ENABLE_GITHUB_APPLY=true or workflow_dispatch apply=true" "${enable_github_apply}"
+          echo ""
+          echo "Publish Github Demo Repo requires:"
+          write_check "variable" "STAGE_REPOSITORY" "${STAGE_REPOSITORY}"
+          write_check "secret" "STAGE_REPO_TOKEN" "${STAGE_REPO_TOKEN}"
+          echo "::endgroup::"
+
+          stage_repository_normalized=""
+          if [[ -n "${STAGE_REPOSITORY}" ]]; then
+            stage_repository_normalized="$(printf '%s' "${STAGE_REPOSITORY}" | tr -d '[:space:]')"
+            stage_repository_normalized="${stage_repository_normalized#https://github.com/}"
+            stage_repository_normalized="${stage_repository_normalized#http://github.com/}"
+            stage_repository_normalized="${stage_repository_normalized#git@github.com:}"
+          fi
+          stage_repository_normalized="${stage_repository_normalized%.git}"
+          stage_repository_normalized="${stage_repository_normalized#/}"
+          stage_repository_normalized="${stage_repository_normalized%/}"
+
+          if [[ -n "${stage_repository_normalized}" && "${CURRENT_REPOSITORY,,}" == "${stage_repository_normalized,,}" ]]; then
+            echo "is_stage_repository=true" >> "${GITHUB_OUTPUT}"
+            echo "Current repository matches the configured stage repository. Loop-prone jobs will be skipped for github-actions[bot]."
+          else
+            echo "is_stage_repository=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+          if [[ -n "${OCI_REGION}" && -n "${OCI_TENANCY_OCID}" && -n "${OCI_USER_OCID}" && -n "${OCI_FINGERPRINT}" && -n "${OCI_PRIVATE_KEY}" ]]; then
+            echo "has_oci_credentials=true" >> "${GITHUB_OUTPUT}"
+            has_oci_credentials="true"
+          else
+            echo "has_oci_credentials=false" >> "${GITHUB_OUTPUT}"
+            has_oci_credentials="false"
+            echo "OCI credentials are missing. Plan and apply jobs will be skipped."
+          fi
+
+          if [[ "${TF_BACKEND_READY}" == "true" && -n "${TF_BACKEND_BUCKET}" && -n "${TF_BACKEND_NAMESPACE}" && -n "${TF_BACKEND_REGION}" && -n "${TF_BACKEND_KEY}" && -n "${OCI_STATE_ACCESS_KEY_ID}" && -n "${OCI_STATE_SECRET_ACCESS_KEY}" ]]; then
+            echo "has_backend_inputs=true" >> "${GITHUB_OUTPUT}"
+            has_backend_inputs="true"
+          else
+            echo "has_backend_inputs=false" >> "${GITHUB_OUTPUT}"
+            has_backend_inputs="false"
+            echo "Remote backend is disabled or incomplete. Terraform jobs will use -backend=false."
+          fi
+
+          if [[ "${enable_github_apply}" == "true" && "${has_oci_credentials}" == "true" ]]; then
+            echo "has_apply_inputs=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "has_apply_inputs=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+          if [[ -n "${STAGE_REPOSITORY}" && -n "${STAGE_REPO_TOKEN}" ]]; then
+            echo "has_stage_publish_inputs=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "has_stage_publish_inputs=false" >> "${GITHUB_OUTPUT}"
+            echo "Stage publish variable/secret is missing. Stage publish job will be skipped."
+          fi
+
+  publish-stage-repo:
+    name: Publish Github Demo Repo
+    if: always() && github.event_name != 'pull_request' && needs['check-required-secrets-variables'].outputs.is_stage_repository != 'true' && needs['check-required-secrets-variables'].outputs.has_stage_publish_inputs == 'true'
+    needs:
+      - check-required-secrets-variables
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'dev' && 'dev' || github.ref_name == 'sbx' && 'sbx' || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Publish clean snapshot to stage repo
+        env:
+          STAGE_REPOSITORY: ${{ vars.STAGE_REPOSITORY }}
+          STAGE_REPO_TOKEN: ${{ secrets.STAGE_REPO_TOKEN }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${STAGE_REPO_TOKEN}" ]]; then
+            echo "Missing required secret: STAGE_REPO_TOKEN" >&2
+            exit 1
+          fi
+
+          if [[ -z "${STAGE_REPOSITORY}" ]]; then
+            echo "Missing required repository variable: STAGE_REPOSITORY" >&2
+            exit 1
+          fi
+
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "${workdir}"' EXIT
+
+          rsync -a \
+            --exclude='.git' \
+            "${GITHUB_WORKSPACE}/" "${workdir}/repo/"
+
+          cd "${workdir}/repo"
+
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${SOURCE_BRANCH}"
+          git add .
+          git commit -m "Stage snapshot from ${SOURCE_BRANCH}@${SOURCE_SHA}"
+
+          stage_repo_token="$(printf '%s' "${STAGE_REPO_TOKEN}" | tr -d '\r\n')"
+          stage_repository_normalized="$(printf '%s' "${STAGE_REPOSITORY}" | tr -d '[:space:]')"
+          stage_repository_normalized="${stage_repository_normalized#https://github.com/}"
+          stage_repository_normalized="${stage_repository_normalized#http://github.com/}"
+          stage_repository_normalized="${stage_repository_normalized#git@github.com:}"
+          stage_repository_normalized="${stage_repository_normalized%.git}"
+          stage_repository_normalized="${stage_repository_normalized#/}"
+          stage_repository_normalized="${stage_repository_normalized%/}"
+
+          if [[ ! "${stage_repository_normalized}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "STAGE_REPOSITORY must be owner/repo or a GitHub repo URL. Got normalized value: ${stage_repository_normalized}" >&2
+            exit 1
+          fi
+
+          target_repo="github.com/${stage_repository_normalized}"
+          git remote add origin "https://x-access-token:${stage_repo_token}@${target_repo}.git"
+          git push --force origin "${SOURCE_BRANCH}"
+
+  validate:
+    name: Validate OCI Terraform
+    needs:
+      - check-required-secrets-variables
+    if: needs['check-required-secrets-variables'].outputs.is_stage_repository != 'true' || github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init without backend
+        run: terraform init -backend=false -input=false -no-color
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Validate modules
+        shell: pwsh
+        run: ./test.ps1
+
+  plan:
+    name: Plan OCI Terraform
+    needs:
+      - check-required-secrets-variables
+      - validate
+    if: always() && github.event_name != 'pull_request' && needs.validate.result == 'success' && needs['check-required-secrets-variables'].outputs.has_oci_credentials == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'dev' && 'dev' || github.ref_name == 'sbx' && 'sbx' || 'dev' }}
+    env:
+      OCI_REGION: ${{ vars.OCI_REGION }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      TF_VAR_private_key: ${{ secrets.OCI_PRIVATE_KEY }}
+      TF_BACKEND_BUCKET: ${{ vars.TF_BACKEND_BUCKET }}
+      TF_BACKEND_NAMESPACE: ${{ vars.TF_BACKEND_NAMESPACE }}
+      TF_BACKEND_REGION: ${{ vars.TF_BACKEND_REGION }}
+      TF_BACKEND_KEY: ${{ vars.TF_BACKEND_KEY }}
+      OCI_STATE_ACCESS_KEY_ID: ${{ secrets.OCI_STATE_ACCESS_KEY_ID }}
+      OCI_STATE_SECRET_ACCESS_KEY: ${{ secrets.OCI_STATE_SECRET_ACCESS_KEY }}
+      TF_ENVIRONMENT: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'sbx' && 'sandbox' || github.ref_name == 'dev' && 'dev' || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs['check-required-secrets-variables'].outputs.has_backend_inputs }}" == "true" ]]; then
+            terraform init \
+              -input=false \
+              -no-color \
+              -reconfigure \
+              -backend-config="bucket=${TF_BACKEND_BUCKET}" \
+              -backend-config="namespace=${TF_BACKEND_NAMESPACE}" \
+              -backend-config="region=${TF_BACKEND_REGION}" \
+              -backend-config="key=${TF_BACKEND_KEY}" \
+              -backend-config="endpoints={s3=\"https://${TF_BACKEND_NAMESPACE}.compat.objectstorage.${TF_BACKEND_REGION}.oraclecloud.com\"}" \
+              -backend-config="access_key=${OCI_STATE_ACCESS_KEY_ID}" \
+              -backend-config="secret_key=${OCI_STATE_SECRET_ACCESS_KEY}"
+          else
+            terraform init -backend=false -input=false -no-color
+          fi
+
+      - name: Terraform plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan \
+            -var-file="environments/${TF_ENVIRONMENT}/terraform.tfvars" \
+            -var="region=${OCI_REGION}" \
+            -var="tenancy_ocid=${OCI_TENANCY_OCID}" \
+            -var="user_ocid=${OCI_USER_OCID}" \
+            -var="fingerprint=${OCI_FINGERPRINT}" \
+            -var="auth=APIKey"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: tfplan
+          if-no-files-found: error
+
+  apply:
+    name: Apply OCI Terraform
+    needs:
+      - check-required-secrets-variables
+      - plan
+    if: always() && github.event_name != 'pull_request' && needs.plan.result == 'success' && needs['check-required-secrets-variables'].outputs.has_apply_inputs == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'dev' && 'dev' || github.ref_name == 'sbx' && 'sbx' || 'dev' }}
+    env:
+      OCI_REGION: ${{ vars.OCI_REGION }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      TF_VAR_private_key: ${{ secrets.OCI_PRIVATE_KEY }}
+      TF_BACKEND_BUCKET: ${{ vars.TF_BACKEND_BUCKET }}
+      TF_BACKEND_NAMESPACE: ${{ vars.TF_BACKEND_NAMESPACE }}
+      TF_BACKEND_REGION: ${{ vars.TF_BACKEND_REGION }}
+      TF_BACKEND_KEY: ${{ vars.TF_BACKEND_KEY }}
+      OCI_STATE_ACCESS_KEY_ID: ${{ secrets.OCI_STATE_ACCESS_KEY_ID }}
+      OCI_STATE_SECRET_ACCESS_KEY: ${{ secrets.OCI_STATE_SECRET_ACCESS_KEY }}
+      TF_ENVIRONMENT: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'sbx' && 'sandbox' || github.ref_name == 'dev' && 'dev' || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs['check-required-secrets-variables'].outputs.has_backend_inputs }}" == "true" ]]; then
+            terraform init \
+              -input=false \
+              -no-color \
+              -reconfigure \
+              -backend-config="bucket=${TF_BACKEND_BUCKET}" \
+              -backend-config="namespace=${TF_BACKEND_NAMESPACE}" \
+              -backend-config="region=${TF_BACKEND_REGION}" \
+              -backend-config="key=${TF_BACKEND_KEY}" \
+              -backend-config="endpoints={s3=\"https://${TF_BACKEND_NAMESPACE}.compat.objectstorage.${TF_BACKEND_REGION}.oraclecloud.com\"}" \
+              -backend-config="access_key=${OCI_STATE_ACCESS_KEY_ID}" \
+              -backend-config="secret_key=${OCI_STATE_SECRET_ACCESS_KEY}"
+          else
+            terraform init -backend=false -input=false -no-color
+          fi
+
+      - name: Terraform Apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform apply \
+            -auto-approve \
+            -input=false \
+            -no-color \
+            -var-file="environments/${TF_ENVIRONMENT}/terraform.tfvars" \
+            -var="region=${OCI_REGION}" \
+            -var="tenancy_ocid=${OCI_TENANCY_OCID}" \
+            -var="user_ocid=${OCI_USER_OCID}" \
+            -var="fingerprint=${OCI_FINGERPRINT}" \
+            -var="auth=APIKey"
