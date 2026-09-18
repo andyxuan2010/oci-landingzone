@@ -1,0 +1,6 @@
+{
+  "title": "OCI Landing Zone",
+  "description": "Terraform composition and operational guidance for the CCOE OCI landing zone.",
+  "eyebrow": "Cloud foundations · OCI infrastructure as code",
+  "repository": "https://github.com/CCOE-Azure/oci-landingzone"
+}
