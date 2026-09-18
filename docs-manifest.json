@@ -1,0 +1,11 @@
+{
+  "generatedAt": "2026-09-17T00:00:00Z",
+  "documents": [
+    "docs/ARCHITECTURE.md",
+    "docs/CURRENT_LANDINGZONE_RESOURCES.md",
+    "docs/PIPELINE.md",
+    "docs/README.md",
+    "docs/ROOT_LEVEL_MODULES_GUIDE.md",
+    "readme.MD"
+  ]
+}
