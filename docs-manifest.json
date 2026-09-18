@@ -1,0 +1,12 @@
+{
+  "documents": [
+    "docs/ARCHITECTURE.md",
+    "docs/CURRENT_LANDINGZONE_RESOURCES.md",
+    "docs/OCI_CLI_AUTHENTICATION.md",
+    "docs/PIPELINE.md",
+    "docs/README.md",
+    "docs/ROOT_LEVEL_MODULES_GUIDE.md",
+    "readme.MD"
+  ],
+  "generatedAt": "2026-09-18T02:16:26Z"
+}
